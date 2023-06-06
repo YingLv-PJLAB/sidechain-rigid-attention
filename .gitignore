@@ -24,3 +24,7 @@ bin/test_sample/
 bin/resutl_5_8
 bin/resutl_5_9
 bin/resutl_5_9_v2
+bin/resutl*
+bin/sample*
+bin/test_sample*
+bin/result*

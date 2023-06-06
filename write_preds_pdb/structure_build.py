@@ -17,7 +17,7 @@ device1 = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 def rotate_sidechain(
                     restype_idx:torch.Tensor, # [*, N]
-                    angles: torch.Tensor # [*,N,4]
+                    angles: torch.Tensor # [*,N,4，2]
                     ) -> geometry.Rigid:
 
     # [21, 8, 4, 4]
@@ -38,8 +38,16 @@ def rotate_sidechain(
     # [*,N,4] + [*,N,4] == [*,N,8]
     # adding 4 zero angles which means no change to the default value.
     #=============================训练时.to('cuda')保留，解开注释===================================================#
+    print("=============sin_angles==============",sin_angles.shape)
+    print("=============cos_angles==============",cos_angles.shape)
+    print("=============torch.zeros(*restype_idx.shape, 4)==============",torch.zeros(*restype_idx.shape, 4).shape)
+    print("=============torch.ones(*restype_idx.shape, 4)==============",torch.ones(*restype_idx.shape, 4).shape)
+    
     sin_angles = torch.cat([torch.zeros(*restype_idx.shape, 4).to('cuda'), sin_angles.to('cuda')],dim=-1)
     cos_angles = torch.cat([torch.ones(*restype_idx.shape, 4).to('cuda'), cos_angles.to('cuda')],dim=-1)
+    print("=============sin_angles==============",sin_angles.shape)
+    print("=============cos_angles==============",cos_angles.shape)
+
     #=============================训练时.to('cuda')保留，解开注释===================================================#
 
     
@@ -216,7 +224,7 @@ def torsion_to_position(aatype_idx: torch.Tensor, # [*, N]
 
 def torsion_to_frame(aatype_idx: torch.Tensor, # [*, N]
                     backbone_position: torch.Tensor, # [*, N, 4, 3] (N, CA, C, O)
-                    angles: torch.Tensor, # [*, N, 4] (X1, X2, X3, X4)
+                    angles_sin_cos: torch.Tensor, # [*, N, 4, 2] (X1, X2, X3, X4)
                     ): # -> [*, N, 5] Rigid
     """Compute all residue frames given torsion
         angles and the fixed backbone coordinates.
@@ -234,20 +242,24 @@ def torsion_to_frame(aatype_idx: torch.Tensor, # [*, N]
     # We create 3 dummy identity matrix for omega and other angles which is not used in the frame attention process
     sc_to_bb = rotate_sidechain(aatype_idx, angles_sin_cos)[..., [0,4,5,6,7]]
 
-    # [*, N] Rigid
+    # [*, N_res] Rigid
     bb_to_gb = geometry.get_gb_trans(backbone_position)
 
     all_frames_to_global = geometry.Rigid_mult(bb_to_gb[..., None], sc_to_bb)
 
-    return all_frames_to_global # return frame 
+    # [*, N_rigid]
+    flatten_frame = geometry.flatten_rigid(all_frames_to_global)
 
-def frame_to_edge(frames, # [*, N, 5]
-                  aatype_idx # [*, N]
+    return flatten_frame # return frame
+
+def frame_to_edge(frames: geometry.Rigid, # [*, N_rigid] Rigid
+                  aatype_idx, # [*, N_res]
+                  pad_mask # [*, N_res]
                   ):
     '''
     compute edge information between two frames distance, direction, orientation
     Args:
-        frames: protein rigid frames [*, N, 5]
+        frames: protein rigid frames [*, N_, 5]
 
     Returns:
 
@@ -255,66 +267,36 @@ def frame_to_edge(frames, # [*, N, 5]
 
     # [20, 5]
     restype_frame5_mask = torch.tensor(restype_frame_mask)
+    print("=========restype_frame5_mask =============",restype_frame5_mask.device)
+    print("=========pad_mask=============",pad_mask.device)
+    # [*, N_res, 5]
+    frame_mask = restype_frame5_mask[aatype_idx, ...].to('cuda')
+    frame_mask = frame_mask * pad_mask[..., None]
+    
+    # [*, N_rigid]
+    flat_mask= torch.flatten(frame_mask, start_dim= -2)
 
-    # [*, N, 5]
-    frame_mask = restype_frame5_mask[aatype_idx, ...] 
+    # [*, N_rigid, N_rigid]
+    pair_mask = flat_mask[..., None] * flat_mask[..., None, :]
+    # [*, N_rigid, N_rigid]
+    distance, altered_direction, orientation = frames.edge()
+    # [*, N_rigid, N_rigid, 3]
+  #  altered_direction = altered_direction.type(torch.float64)
+    # [*, N_rigid, N_rigid, 3, 3]
+  #  orientation = orientation.type(torch.float64)
 
-    # [*, Nx5]
-    flat_mask= torch.flatten(frame_mask, start_dim= -2) # mask
-    # [*, Nx5, Nx5]
-    frame_pair_mask = torch.bmm(flat_mask.unsqueeze(-1), flat_mask.unsqueeze(-2))
-    # [*, Nx5]
-    flatten_frame = geometry.flatten_rigid(frames)
-
-    distance, altered_direction, orientation = flatten_frame.edge()
-    altered_direction = altered_direction.type(torch.float64)
-    altered_direction = altered_direction.type(torch.float64)
-    return frame_pair_mask, distance, altered_direction, orientation
-
-'''
-result = {}
-features = {}
-
-features["final_atom_mask"] = restype_atom37_mask[features["aatype_idx"]]  # [*,N,14,3]
-result["final_atom_positions"] = torsion_to_position(features["aatype_idx"],
-                                                     features["backbone_position"],
-                                                     result["angles"])# [*,N...]
-
-resulted_protein = protein.Protein(
-                            aatype=features["aatype_idx"], # [*,N]
-                            atom_positions=result["final_atom_positions"],
-                            atom_mask=features["final_atom_mask"],
-                            residue_index=features["residue_index"] + 1,
-                            b_factors=np.zeros_like(features["final_atom_mask"]))
-
-pdb_str = protein.to_pdb(resulted_protein)
-produced_pdb_file_path = '' # given a pdb_path
-with open(produced_pdb_file_path, 'w') as fp:
-    fp.write(pdb_str)
-'''
+    return pair_mask, flat_mask, distance, altered_direction, orientation
 
 def write_preds_pdb_file(structure, sampled_dfs, out_path, fname, j):
     
-    temp_dict = list(structure.keys())
-   # print(temp_dict)
+
     final_atom_mask = restype_atom37_mask[structure["seq"]]
-    #print(" final_atom_mask=", final_atom_mask)
-    #print(" final_atom_mask type", type(final_atom_mask))
-  #  print("sampled_dfs[0]",sampled_dfs[0])
-    #print("sampled_dfs[0]",type(sampled_dfs))
-  #  print("===========================seq=",dataset["seq"])
+
     seq_list = torch.from_numpy(structure["seq"])
-    #print("dataset[0][coords]",type(dataset[0]["coords"]))
     coord_list = structure["coords"]
     
     coord_list = torch.from_numpy(coord_list)
     angle_list = torch.from_numpy(sampled_dfs)
-    #print("seq_list==",seq_list.shape)
-    #print("coord_list==",coord_list.shape)
-    #print("angle_list==",angle_list.shape)
-    
-    
-    
     final_atom_positions = torsion_to_position(seq_list, 
                                                coord_list,
                                                 angle_list) 

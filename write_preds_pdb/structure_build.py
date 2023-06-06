@@ -230,8 +230,6 @@ def torsion_to_frame(aatype_idx: torch.Tensor, # [*, N]
             all frames [N, 5] Rigid
         """
 
-    angles_sin_cos = torch.stack([torch.sin(angles), torch.cos(angles)], dim=-1)
-
     # side chain frames [*, N, 5] Rigid
     # We create 3 dummy identity matrix for omega and other angles which is not used in the frame attention process
     sc_to_bb = rotate_sidechain(aatype_idx, angles_sin_cos)[..., [0,4,5,6,7]]
